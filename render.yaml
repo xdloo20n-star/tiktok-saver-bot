@@ -1,0 +1,13 @@
+services:
+  - type: worker
+    name: tiktok-saver-bot
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: MAX_FILE_SIZE_MB
+        value: "50"
+      - key: DOWNLOAD_TIMEOUT_SEC
+        value: "60"
