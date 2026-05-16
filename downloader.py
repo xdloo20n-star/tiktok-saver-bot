@@ -3,7 +3,6 @@ import logging
 import os
 import re
 import shutil
-import urllib.parse
 import urllib.request
 import uuid
 from dataclasses import dataclass, field
@@ -55,24 +54,16 @@ class VideoUnavailableError(DownloadError):
 
 # ── URL normalisation ─────────────────────────────────────────────────────────
 
-def _to_ydl_url(url: str) -> str:
+def _photo_to_video_url(url: str) -> str:
     """
-    yt-dlp doesn't recognise /photo/ URLs. Steps:
-      1. Resolve vm/vt short URLs so we can see the actual path.
-      2. Rewrite /photo/<id> → /video/<id> — same numeric ID, yt-dlp handles both.
+    yt-dlp's TikTok extractor only matches /video/ paths.
+    TikTok uses the same numeric ID for photos and videos, so /photo/<id>
+    can always be rewritten to /video/<id> — content type is determined
+    by the API response (presence of 'images' field), not the URL path.
+    Strip tracking query params to keep the URL clean.
     """
-    parsed = urllib.parse.urlparse(url)
-    if parsed.netloc in ("vm.tiktok.com", "vt.tiktok.com"):
-        try:
-            req = urllib.request.Request(url, headers=_CDN_HEADERS)
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                url = resp.url
-            logger.debug("Resolved short URL → %s", url)
-        except Exception as exc:
-            logger.debug("Short URL resolution failed, proceeding as-is: %s", exc)
-
-    url = re.sub(r"/photo/(\d+)", r"/video/\1", url)
-    return url
+    url = url.split("?")[0]
+    return re.sub(r"/photo/(\d+)", r"/video/\1", url)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -174,12 +165,29 @@ def _sync_download_audio(url: str, output_dir: str) -> str | None:
 
 # ── Router ────────────────────────────────────────────────────────────────────
 
-def _sync_fetch(url: str, output_dir: str) -> ContentResult:
-    ydl_url = _to_ydl_url(url)
-    logger.debug("yt-dlp URL: %s", ydl_url)
-
+def _extract_info(ydl_url: str) -> dict:
     with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "noplaylist": True}) as ydl:
-        info = ydl.extract_info(ydl_url, download=False)
+        return ydl.extract_info(ydl_url, download=False)
+
+
+def _sync_fetch(url: str, output_dir: str) -> ContentResult:
+    # For direct /photo/ URLs, rewrite immediately.
+    # For short URLs (vm/vt.tiktok.com), yt-dlp follows the redirect itself;
+    # if it lands on a /photo/ URL it raises "Unsupported URL" — we catch
+    # that, extract the resolved URL from the error message, and retry.
+    ydl_url = _photo_to_video_url(url)
+
+    try:
+        info = _extract_info(ydl_url)
+    except yt_dlp.utils.DownloadError as exc:
+        exc_str = str(exc)
+        if "Unsupported URL:" in exc_str and "/photo/" in exc_str:
+            resolved = exc_str.split("Unsupported URL:", 1)[1].strip()
+            ydl_url = _photo_to_video_url(resolved)
+            logger.info("Photo post detected via redirect, retrying as: %s", ydl_url)
+            info = _extract_info(ydl_url)
+        else:
+            raise
 
     if not info:
         raise DownloadError("Не удалось получить информацию о контенте")
