@@ -1,17 +1,20 @@
 import asyncio
 import logging
-import os
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
-from aiogram.types import FSInputFile, Message
+from aiogram.types import FSInputFile, InputMediaPhoto, Message
 
 from config import BOT_TOKEN, MAX_FILE_SIZE_BYTES, PROXY_URL
 from downloader import (
+    ContentResult,
     DownloadError,
     FileTooLargeError,
+    PhotoResult,
+    VideoResult,
     VideoUnavailableError,
-    download_video,
+    cleanup_result,
+    download_content,
 )
 from validators import extract_tiktok_url, is_tiktok_url
 
@@ -24,15 +27,17 @@ logger = logging.getLogger(__name__)
 bot = Bot(token=BOT_TOKEN, **{"proxy": PROXY_URL} if PROXY_URL else {})
 dp = Dispatcher()
 
-# Track users with an active download to enforce one-request-at-a-time
 _active_users: set[int] = set()
 
 START_TEXT = (
     "Привет! 👋\n\n"
-    "Я умею скачивать видео из TikTok и отправлять их тебе.\n\n"
-    "Просто отправь мне ссылку на видео — и готово.\n\n"
+    "Я умею скачивать контент из TikTok:\n"
+    "• Видео — пришлю файл\n"
+    "• Фото-карусель — пришлю все фото + фоновую музыку\n\n"
+    "Просто отправь ссылку.\n\n"
     "Поддерживаемые форматы ссылок:\n"
     "• https://www.tiktok.com/@user/video/...\n"
+    "• https://www.tiktok.com/@user/photo/...\n"
     "• https://vm.tiktok.com/...\n"
     "• https://vt.tiktok.com/...\n\n"
     "/help — справка"
@@ -41,13 +46,13 @@ START_TEXT = (
 HELP_TEXT = (
     "Что я умею:\n"
     "• Скачивать публичные TikTok-видео\n"
-    "• Отправлять видео прямо в чат\n\n"
+    "• Скачивать фото-карусели (все фото по порядку + музыка)\n\n"
     "Ограничения:\n"
-    f"• Максимальный размер: {MAX_FILE_SIZE_BYTES // (1024*1024)} МБ\n"
-    "• Только публичные видео\n"
+    f"• Максимальный размер видео: {MAX_FILE_SIZE_BYTES // (1024 * 1024)} МБ\n"
+    "• Только публичные посты\n"
     "• Один запрос за раз\n"
-    "• Видео не сохраняются на сервере\n\n"
-    "Просто отправь ссылку на TikTok-видео."
+    "• Файлы не сохраняются на сервере\n\n"
+    "Просто отправь ссылку на TikTok-пост."
 )
 
 
@@ -80,34 +85,48 @@ async def handle_message(message: Message) -> None:
 
     url = extract_tiktok_url(text)
     _active_users.add(user_id)
-    status_msg = await message.answer("Скачиваю видео...")
+    status_msg = await message.answer("Скачиваю...")
 
-    file_path: str | None = None
+    result: ContentResult | None = None
     try:
-        result = await download_video(url)
-        file_path = result.file_path
+        result = await download_content(url)
 
-        await status_msg.edit_text("Отправляю видео...")
-        video_file = FSInputFile(file_path)
-        await message.answer_video(video_file)
+        if isinstance(result, VideoResult):
+            await status_msg.edit_text("Отправляю видео...")
+            await message.answer_video(FSInputFile(result.file_path))
+
+        elif isinstance(result, PhotoResult):
+            await status_msg.edit_text(
+                f"Отправляю {len(result.image_paths)} фото"
+                + (" и музыку..." if result.audio_path else "...")
+            )
+            # Telegram allows max 10 items per media group
+            media = [InputMediaPhoto(media=FSInputFile(p)) for p in result.image_paths]
+            for i in range(0, len(media), 10):
+                await message.answer_media_group(media[i : i + 10])
+
+            if result.audio_path:
+                await message.answer_audio(
+                    FSInputFile(result.audio_path),
+                    title="Фоновая музыка",
+                )
+
+        await status_msg.delete()
 
     except FileTooLargeError as exc:
         await status_msg.edit_text(f"Видео слишком большое: {exc}")
     except VideoUnavailableError as exc:
-        await status_msg.edit_text(f"Видео недоступно: {exc}")
+        await status_msg.edit_text(f"Пост недоступен: {exc}")
     except DownloadError as exc:
-        logger.error("DownloadError for user %s, url %s: %s", user_id, url, exc)
+        logger.error("DownloadError for user %s url %s: %s", user_id, url, exc)
         await status_msg.edit_text(f"Ошибка скачивания: {exc}")
     except Exception as exc:
-        logger.exception("Unexpected error for user %s, url %s", user_id, url)
+        logger.exception("Unexpected error for user %s url %s", user_id, url)
         await status_msg.edit_text("Произошла неожиданная ошибка. Попробуй позже.")
     finally:
         _active_users.discard(user_id)
-        if file_path and os.path.exists(file_path):
-            try:
-                os.remove(file_path)
-            except OSError as exc:
-                logger.warning("Could not remove temp file %s: %s", file_path, exc)
+        if result is not None:
+            cleanup_result(result)
 
 
 async def main() -> None:

@@ -1,7 +1,7 @@
 import re
 
 TIKTOK_PATTERN = re.compile(
-    r"https?://(www\.tiktok\.com/@[\w.]+/video/\d+|vm\.tiktok\.com/\w+|vt\.tiktok\.com/\w+)",
+    r"https?://(www\.tiktok\.com/@[\w.]+/(video|photo)/\d+|vm\.tiktok\.com/\w+|vt\.tiktok\.com/\w+)",
     re.IGNORECASE,
 )
 
