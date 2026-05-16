@@ -1,7 +1,9 @@
 import asyncio
 import logging
 import os
+import re
 import shutil
+import urllib.parse
 import urllib.request
 import uuid
 from dataclasses import dataclass, field
@@ -49,6 +51,28 @@ class FileTooLargeError(DownloadError):
 
 class VideoUnavailableError(DownloadError):
     pass
+
+
+# ── URL normalisation ─────────────────────────────────────────────────────────
+
+def _to_ydl_url(url: str) -> str:
+    """
+    yt-dlp doesn't recognise /photo/ URLs. Steps:
+      1. Resolve vm/vt short URLs so we can see the actual path.
+      2. Rewrite /photo/<id> → /video/<id> — same numeric ID, yt-dlp handles both.
+    """
+    parsed = urllib.parse.urlparse(url)
+    if parsed.netloc in ("vm.tiktok.com", "vt.tiktok.com"):
+        try:
+            req = urllib.request.Request(url, headers=_CDN_HEADERS)
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                url = resp.url
+            logger.debug("Resolved short URL → %s", url)
+        except Exception as exc:
+            logger.debug("Short URL resolution failed, proceeding as-is: %s", exc)
+
+    url = re.sub(r"/photo/(\d+)", r"/video/\1", url)
+    return url
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -151,8 +175,11 @@ def _sync_download_audio(url: str, output_dir: str) -> str | None:
 # ── Router ────────────────────────────────────────────────────────────────────
 
 def _sync_fetch(url: str, output_dir: str) -> ContentResult:
+    ydl_url = _to_ydl_url(url)
+    logger.debug("yt-dlp URL: %s", ydl_url)
+
     with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "noplaylist": True}) as ydl:
-        info = ydl.extract_info(url, download=False)
+        info = ydl.extract_info(ydl_url, download=False)
 
     if not info:
         raise DownloadError("Не удалось получить информацию о контенте")
@@ -166,10 +193,10 @@ def _sync_fetch(url: str, output_dir: str) -> ContentResult:
         image_paths = _sync_download_images(images, output_dir)
         if not image_paths:
             raise DownloadError("Не удалось скачать ни одной фотографии из поста")
-        audio_path = _sync_download_audio(url, output_dir)
+        audio_path = _sync_download_audio(ydl_url, output_dir)
         return PhotoResult(image_paths=image_paths, audio_path=audio_path, dir=output_dir)
 
-    file_path = _sync_download_video(url, output_dir)
+    file_path = _sync_download_video(ydl_url, output_dir)
     size = os.path.getsize(file_path)
     if size > MAX_FILE_SIZE_BYTES:
         max_mb = MAX_FILE_SIZE_BYTES // (1024 * 1024)
